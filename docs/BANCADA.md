@@ -26,9 +26,9 @@ P3 é um job separado. Sem os três segredos `MT5_DEMO_LOGIN`, `MT5_DEMO_PASSWOR
 
 Com os três segredos, o job compila `ForgeSynthMA.mq5` e lança duas vezes:
 
-`terminal64.exe /portable /config:<ini temporário>`
+`terminal64.exe /portable /config:"<caminho absoluto do ini>"`
 
-O ini tem `[Common]` com o login, a password e o servidor vindos só dos segredos, e `[Experts]` com `AllowLiveTrading=0`. `[Tester]` fica fixo:
+O ini fica numa pasta privada, fora do artefacto, e é apagado no fim. O caminho passado a `/config:` é absoluto e vai entre aspas. `[Common]` tem o login, a password e o servidor vindos só dos segredos, e `[Experts]` tem `AllowLiveTrading=0`. `[Tester]` fica fixo. `Report=` usa o caminho absoluto `<Install>\reports\run1` no primeiro arranque e `<Install>\reports\run2` no segundo, sem extensão:
 
 | Chave | Valor |
 | --- | --- |
@@ -49,13 +49,19 @@ O ini tem `[Common]` com o login, a password e o servidor vindos só dos segredo
 | Visual | 0 |
 | ShutdownTerminal | 1 |
 
-Os dois relatórios são lidos como HTML. O job compara, como texto, `Total Net Profit`, `Total Trades` e o drawdown máximo (`Equity Drawdown Maximal`, ou `Balance Drawdown Maximal` se o primeiro não existir). Os dois runs têm de usar o mesmo rótulo e o mesmo valor.
+O job procura o relatório por esta ordem: `run1.htm`, `run1.html`, `run1.xml` (e o mesmo para `run2`). Primeiro em `<Install>\reports`, depois no resto de `<Install>` e em `%APPDATA%\MetaQuotes`. O artefacto guarda o ficheiro encontrado, com a extensão real. O texto é lido como HTML, ou como XML se só esse existir. O job compara, como texto, `Total Net Profit`, `Total Trades` e o drawdown máximo (`Equity Drawdown Maximal`, ou `Balance Drawdown Maximal` se o primeiro não existir). Os dois runs têm de usar o mesmo rótulo e o mesmo valor.
 
-Prova, quando o job fica verde com segredos: o instalador passou a verificação descrita em «Instalador» e, neste terminal, com este histórico descarregado na mesma sessão, os dois runs produziram os mesmos três campos. Os artefactos levam os relatórios redatados, o JSON, `installer-signature.txt` e os sha256. O ini temporário é apagado e não entra no artefacto.
+Cada arranque espera no máximo 45 minutos, contados desde o início desse `terminal64.exe`. O prazo inclui o login demo e o download do histórico. O job P3 tem `timeout-minutes: 120`, para caber a instalação (até 15 minutos) e os dois prazos de 45. P1 e P2 mantêm 30 minutos e não usam este prazo.
 
-Não prova: conta real, ordens fora do tester, o mesmo resultado noutro corretor ou noutra máquina, estabilidade do histórico ao longo do tempo, nem qualquer mérito económico do EA. `UseCloud=0` e `UseRemote=0` deixam de fora a rede paga de agentes. Também não prova que os relatórios omitidos do log estão livres de segredos: essa redacção é feita no passo do tester, com `Hide`, antes do upload. `Hide` não substitui valores com menos de 3 caracteres.
+Se, no fim do arranque, não houver relatório e o log do terminal ou do tester mostrar falha de autorização do login demo (`authorization failed`, `authorization on … failed`, `invalid account`, `login failed`, ou o equivalente em português), o job escreve `p3: falhou` e `login demo recusado` e não inicia o outro run.
 
-Cada job instala o terminal à parte. A instalação espera no máximo 15 minutos pelos executáveis. Cada um dos dois runs do tester espera no máximo 20 minutos pelo relatório. Se o histórico demo não chegar nesse prazo, P3 falha; P1 e P2 não dependem desse prazo.
+No fim do passo do tester, com sucesso ou com falha, o job grava `diagnostico.txt` e imprime-o. O ficheiro leva, depois de `Hide`: as últimas 80 linhas de cada log em `<Install>\logs\*.log`, `<Install>\Tester\logs\*.log` e `<Install>\Tester\*\logs\*.log`; a lista de `*.htm`, `*.html` e `*.xml` em `<Install>` e em `%APPDATA%\MetaQuotes`, só com nome e tamanho; e se o `terminal64` daquele run terminou sozinho ou foi morto no prazo. Linhas que ainda contenham o login, a password ou o servidor são omitidas. Não entram `tester.ini`, `accounts.dat`, `*.srv` nem o ini com as credenciais. Sem os três segredos o terminal não é instalado e `diagnostico.txt` diz `terminal nao instalado`.
+
+Prova, quando o job fica verde com segredos: o instalador passou a verificação descrita em «Instalador» e, neste terminal, com este histórico descarregado na mesma sessão, os dois runs produziram os mesmos três campos. Os artefactos levam os relatórios redatados, o JSON, `diagnostico.txt`, `installer-signature.txt` e os sha256. O ini temporário é apagado e não entra no artefacto.
+
+Não prova: conta real, ordens fora do tester, o mesmo resultado noutro corretor ou noutra máquina, estabilidade do histórico ao longo do tempo, nem qualquer mérito económico do EA. `UseCloud=0` e `UseRemote=0` deixam de fora a rede paga de agentes. As 80 linhas do diagnóstico não são o log completo. Também não prova que os relatórios omitidos do corpo do log estão livres de segredos: essa redacção é feita no passo do tester, com `Hide`, antes do upload. `Hide` não substitui valores com menos de 3 caracteres; essas linhas, se ainda tiverem o valor, são omitidas em vez de gravadas.
+
+Cada job instala o terminal à parte. A instalação espera no máximo 15 minutos pelos executáveis. Se o histórico demo não chegar nos 45 minutos daquele run, P3 falha; P1 e P2 não dependem desse prazo.
 
 ## Instalador
 
@@ -73,7 +79,7 @@ O job só arranca o instalador se as três condições se verificarem ao mesmo t
 
 Quando a assinatura é aceite, a instalação usa `/auto /path:C:\mt5-bancada`, a forma automática documentada em `https://www.metatrader5.com/en/terminal/help/start_advanced/installation`. Não há outro instalador, mirror nem pacote de terceiros. Em P3 sem os três segredos, o instalador não é descarregado: não há verificação de assinatura nesse ramo, e `installer-signature.txt` fica ausente.
 
-O modo `/portable` está documentado em `https://www.metatrader5.com/en/terminal/help/start_advanced/start` e fixa os dados no diretório de instalação, para o relatório ficar em `reports\`.
+O modo `/portable` está documentado em `https://www.metatrader5.com/en/terminal/help/start_advanced/start` e fixa os dados no diretório de instalação. `Report=` repete o caminho absoluto `<Install>\reports\<run>`, sem extensão.
 
 ### O que a verificação Authenticode prova
 
@@ -94,7 +100,7 @@ Cada job tem um passo final `Evidencia no log` com `if: always()`, portanto tamb
 
 Em P1 e P2 imprime ainda as linhas do log de compilação que contenham `error`, `warning` ou `result`, sem distinção de maiúsculas, no máximo 50. Se houver mais, o log indica o corte. Não imprime o resto do log.
 
-Em P3 esse passo não imprime o log de compilação nem os relatórios. Volta a aplicar `::add-mask::` e `Hide` ao texto que imprime. Sem segredos, `resultado.txt` contém `skipped: demo secrets ausentes` e `installer-signature.txt` está ausente.
+Em P3 esse passo não imprime o log de compilação nem o corpo dos relatórios. Imprime `diagnostico.txt` (ou `ausente`). Volta a aplicar `::add-mask::` e `Hide`, e omite linhas que ainda contenham o login, a password ou o servidor. Sem segredos, `resultado.txt` contém `skipped: demo secrets ausentes`, `diagnostico.txt` diz que o terminal não foi instalado, e `installer-signature.txt` está ausente.
 
 Isto mostra o desfecho a quem lê o log do Actions. Não torna descarregável um artefacto que o verificador não consiga abrir. Se o job for cancelado por tempo limite antes deste passo, o log pode ficar sem este bloco.
 
@@ -104,7 +110,7 @@ O workflow pede apenas `permissions: contents: read` para P1, P2 e P3. Não pede
 
 ## Segredos
 
-Os três valores existem só como GitHub Secrets, criados pelo Fundador. Não há credenciais nestes ficheiros. O workflow não escreve os valores em claro. Em P3, cada passo que os recebe regista `::add-mask::` e passa o texto impresso ou gravado por `Hide`, que substitui cada valor de pelo menos 3 caracteres por `[redacted]`. Antes do upload, login, password e servidor são substituídos nos ficheiros de texto do artefacto. O passo de evidência de P3 não imprime o log de compilação nem os relatórios.
+Os três valores existem só como GitHub Secrets, criados pelo Fundador. Não há credenciais nestes ficheiros. O workflow não escreve os valores em claro. Em P3, cada passo que os recebe regista `::add-mask::` e passa o texto impresso ou gravado por `Hide`, que substitui cada valor de pelo menos 3 caracteres por `[redacted]`. Linhas que ainda contenham o login, a password ou o servidor não são gravadas. Antes do upload, os ficheiros de texto do artefacto passam outra vez por essa redacção. O passo de evidência de P3 não imprime o log de compilação nem o corpo dos relatórios; imprime o diagnóstico já redatado.
 
 ## Fora desta bancada
 
@@ -112,6 +118,6 @@ Conta real, repositório `JulioCosta75/Mt5`, material privado, ordens com o term
 
 ## O que ainda não foi executado
 
-O ambiente que escreveu a correção do despacho 4 não tem Windows nem MetaTrader 5. `Get-AuthenticodeSignature` não foi executado aqui. P1, P2 e P3 não foram corridos sobre este YAML. O run `39955626939` é anterior a esta correção e não a valida.
+O ambiente que escreveu a correção do despacho 5 não tem Windows nem MetaTrader 5. `Get-AuthenticodeSignature` não foi executado aqui. P1, P2 e P3 não foram corridos sobre este YAML. O run `39965798939` é a falha que esta correção responde (`P3: relatorio run1.htm ausente`) e não a valida.
 
 A prova fica para o Actions do repositório de bancada, depois da transferência sem alterações e da conferência dos SHA-256. Enquanto o workflow está em `mt5-bancada/.github/workflows/` no orchestrator, o GitHub não o executa: só lê workflows em `.github/workflows/` na raiz. O registo dessa limitação está em `docs/planning/f6/entrega/ENTREGA.md` no `forge-orchestrator`; esse ficheiro não faz parte da árvore transferida.

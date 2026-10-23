@@ -571,7 +571,7 @@ jobs:
   P3:
     name: P3 strategy tester
     runs-on: windows-latest
-    timeout-minutes: 70
+    timeout-minutes: 120
     steps:
       - name: Obter o codigo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -600,8 +600,13 @@ jobs:
           if ($missing) {
             $utf8 = New-Object System.Text.UTF8Encoding $false
             [System.IO.File]::WriteAllText((Join-Path $outDir "resultado.txt"), "skipped: demo secrets ausentes`n", $utf8)
-            $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $outDir "resultado.txt")).Hash.ToLowerInvariant()
-            [System.IO.File]::WriteAllText((Join-Path $outDir "MANIFEST.sha256"), ("{0}  resultado.txt`n" -f $hash), $utf8)
+            [System.IO.File]::WriteAllText((Join-Path $outDir "diagnostico.txt"), "diagnostico: terminal nao instalado`nprocesso: nao iniciado`n", $utf8)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($name in @("diagnostico.txt", "resultado.txt")) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $outDir $name)).Hash.ToLowerInvariant()
+              [void]$sb.AppendLine(("{0}  {1}" -f $hash, $name))
+            }
+            [System.IO.File]::WriteAllText((Join-Path $outDir "MANIFEST.sha256"), $sb.ToString(), $utf8)
             Write-Output "skipped: demo secrets ausentes"
             "skipped=true" >> $env:GITHUB_OUTPUT
           } else {
@@ -836,13 +841,159 @@ jobs:
             return $null
           }
 
-          function Find-Report([string]$name) {
+          function Test-ForbiddenName([string]$name) {
+            $lower = $name.ToLowerInvariant()
+            if ($lower -eq "tester.ini") { return $true }
+            if ($lower -eq "accounts.dat") { return $true }
+            if ($lower.EndsWith(".srv")) { return $true }
+            if ($lower.EndsWith(".ini")) { return $true }
+            return $false
+          }
+
+          function Redact-Text([string]$text) {
+            if ($null -eq $text) { return "" }
+            $hidden = Hide $text
+            $kept = New-Object System.Collections.Generic.List[string]
+            foreach ($line in ($hidden -split '\r?\n')) {
+              $drop = $false
+              foreach ($secretName in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+                $value = [Environment]::GetEnvironmentVariable($secretName)
+                if (-not [string]::IsNullOrEmpty($value) -and $line.Contains($value)) { $drop = $true; break }
+              }
+              if (-not $drop) { [void]$kept.Add($line) }
+            }
+            return ($kept -join "`n")
+          }
+
+          function Get-P3LogFiles {
+            $found = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            $dirs = New-Object System.Collections.Generic.List[string]
+            [void]$dirs.Add((Join-Path $Install "logs"))
+            [void]$dirs.Add((Join-Path $Install "Tester\logs"))
+            $testerRoot = Join-Path $Install "Tester"
+            if (Test-Path $testerRoot) {
+              foreach ($sub in @(Get-ChildItem -Path $testerRoot -Directory -ErrorAction SilentlyContinue)) {
+                [void]$dirs.Add((Join-Path $sub.FullName "logs"))
+              }
+            }
+            foreach ($dir in $dirs) {
+              if (-not (Test-Path $dir)) { continue }
+              foreach ($file in @(Get-ChildItem -Path $dir -Filter *.log -File -ErrorAction SilentlyContinue)) {
+                if (Test-ForbiddenName $file.Name) { continue }
+                [void]$found.Add($file)
+              }
+            }
+            return @($found | Sort-Object -Property FullName)
+          }
+
+          function Test-LoginRefused {
+            foreach ($file in @(Get-P3LogFiles)) {
+              $raw = Read-TextFile $file.FullName
+              foreach ($line in ($raw -split '\r?\n')) {
+                if ($line -match '(?i)authorization failed') { return $true }
+                if ($line -match '(?i)authorization on .+ failed') { return $true }
+                if ($line -match '(?i)invalid account') { return $true }
+                if ($line -match '(?i)\blogin failed\b') { return $true }
+                if ($line -match '(?i)autoriza[cç][aã]o falh') { return $true }
+                if ($line -match '(?i)falha de autoriza') { return $true }
+              }
+            }
+            return $false
+          }
+
+          function Stop-TerminalProcesses {
+            Get-Process -Name terminal64,metatester64 -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          function Get-P3ReportListing {
+            $rows = New-Object System.Collections.Generic.List[string]
             $roots = @($Install, (Join-Path $env:APPDATA "MetaQuotes"))
             foreach ($root in $roots) {
               if (-not (Test-Path $root)) { continue }
-              $hit = Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-              if ($hit) { return $hit.FullName }
+              $files = @(Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '(?i)^\.(htm|html|xml)$' } |
+                Sort-Object -Property FullName)
+              foreach ($file in $files) {
+                if (Test-ForbiddenName $file.Name) { continue }
+                $clean = (Redact-Text ("{0}  {1}" -f $file.Length, $file.FullName)).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($clean)) { [void]$rows.Add($clean) }
+              }
+            }
+            return $rows
+          }
+
+          function Write-P3Diagnostic {
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine("diagnostico p3")
+            if ($null -eq $script:runNotes -or $script:runNotes.Count -eq 0) {
+              [void]$sb.AppendLine("processo: nao iniciado")
+            } else {
+              foreach ($note in $script:runNotes) { [void]$sb.AppendLine([string]$note) }
+            }
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("----- logs (ultimas 80 linhas) -----")
+            $logFiles = @(Get-P3LogFiles)
+            if ($logFiles.Count -eq 0) {
+              [void]$sb.AppendLine("logs: ausentes")
+            } else {
+              foreach ($file in $logFiles) {
+                [void]$sb.AppendLine(("== {0} ==" -f $file.FullName))
+                $raw = Read-TextFile $file.FullName
+                $lines = @($raw -split '\r?\n')
+                $start = 0
+                if ($lines.Count -gt 80) { $start = $lines.Count - 80 }
+                $tail = New-Object System.Collections.Generic.List[string]
+                for ($i = $start; $i -lt $lines.Count; $i++) { [void]$tail.Add([string]$lines[$i]) }
+                [void]$sb.AppendLine((Redact-Text ($tail -join "`n")))
+              }
+            }
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("----- htm html xml (nome e tamanho) -----")
+            $reports = @(Get-P3ReportListing)
+            if ($reports.Count -eq 0) {
+              [void]$sb.AppendLine("relatorios: ausentes")
+            } else {
+              foreach ($row in $reports) { [void]$sb.AppendLine([string]$row) }
+            }
+            $text = Redact-Text ($sb.ToString())
+            if (-not $text.EndsWith("`n")) { $text = $text + "`n" }
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "diagnostico.txt"), $text, $utf8)
+            Write-Output "----- diagnostico -----"
+            Write-Output $text
+          }
+
+          function Redact-OutDir {
+            if (-not (Test-Path $OutDir)) { return }
+            $allowed = @(".htm", ".html", ".xml", ".log", ".txt", ".json")
+            foreach ($file in @(Get-ChildItem -Path $OutDir -File)) {
+              $ext = $file.Extension.ToLowerInvariant()
+              if ($allowed -notcontains $ext) { continue }
+              if (Test-ForbiddenName $file.Name) { continue }
+              try {
+                $clean = Redact-Text (Read-TextFile $file.FullName)
+                [System.IO.File]::WriteAllText($file.FullName, $clean, $utf8)
+              } catch {
+                Write-Output (Redact-Text ([string]$_.Exception.Message))
+              }
+            }
+          }
+
+          function Find-Report([string]$stem) {
+            $names = @("$stem.htm", "$stem.html", "$stem.xml")
+            $direct = Join-Path $Install "reports"
+            foreach ($name in $names) {
+              $candidate = Join-Path $direct $name
+              if (Test-Path -LiteralPath $candidate) { return (Resolve-Path -LiteralPath $candidate).Path }
+            }
+            $roots = @($Install, (Join-Path $env:APPDATA "MetaQuotes"))
+            foreach ($name in $names) {
+              foreach ($root in $roots) {
+                if (-not (Test-Path $root)) { continue }
+                $hit = Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+                if ($hit) { return $hit.FullName }
+              }
             }
             return $null
           }
@@ -881,39 +1032,63 @@ jobs:
               "UseRemote=0",
               "UseCloud=0",
               "Visual=0",
-              ("Report=reports\{0}" -f $stem),
+              ("Report={0}" -f (Join-Path (Join-Path $Install "reports") $stem)),
               "ReplaceReport=1",
               "ShutdownTerminal=1"
             )
             [System.IO.File]::WriteAllLines($path, $lines, $utf8)
           }
 
+          function Copy-Report([string]$source, [string]$stem) {
+            $ext = [System.IO.Path]::GetExtension($source)
+            if ([string]::IsNullOrWhiteSpace($ext)) { $ext = ".htm" }
+            $dest = Join-Path $OutDir ($stem + $ext.ToLowerInvariant())
+            Copy-Item -LiteralPath $source -Destination $dest -Force
+            $clean = Redact-Text (Read-TextFile $dest)
+            [System.IO.File]::WriteAllText($dest, $clean, $utf8)
+            return $dest
+          }
+
           function Invoke-Tester([string]$stem) {
             $ini = Join-Path $PrivateDir "$stem.ini"
             New-Item -ItemType Directory -Force -Path (Join-Path $Install "reports") | Out-Null
             Write-TesterIni $ini $stem
+            $configPath = [System.IO.Path]::GetFullPath($ini)
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = Join-Path $Install "terminal64.exe"
-            $psi.Arguments = "/portable /config:$ini"
+            $psi.Arguments = ('/portable /config:"{0}"' -f $configPath)
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             $proc = New-Object System.Diagnostics.Process
             $proc.StartInfo = $psi
             [void]$proc.Start()
-            $deadline = (Get-Date).AddMinutes(20)
+            $deadline = (Get-Date).AddMinutes(45)
             $found = $null
+            $disposition = "desconhecido"
             while ((Get-Date) -lt $deadline) {
-              $found = Find-Report "$stem.htm"
-              $running = @(Get-Process -Name terminal64,metatester64 -ErrorAction SilentlyContinue)
-              if ($found -and $running.Count -eq 0) { break }
-              if ($proc.HasExited -and $found) { break }
+              $found = Find-Report $stem
+              if ($proc.HasExited) {
+                $disposition = "terminou sozinho"
+                break
+              }
               Start-Sleep -Seconds 5
             }
-            Get-Process -Name terminal64,metatester64 -ErrorAction SilentlyContinue |
-              Stop-Process -Force -ErrorAction SilentlyContinue
+            if (-not $proc.HasExited) {
+              Stop-TerminalProcesses
+              $disposition = "morto no prazo"
+            } elseif ($disposition -eq "desconhecido") {
+              $disposition = "terminou sozinho"
+            }
             Start-Sleep -Seconds 3
-            if (-not $found) { $found = Find-Report "$stem.htm" }
-            if (-not $found) { throw "P3: relatorio $stem.htm ausente" }
+            if (-not $found) { $found = Find-Report $stem }
+            $authStop = (-not $found) -and (Test-LoginRefused)
+            if ($authStop) {
+              $script:loginRecusado = $true
+              $disposition = "{0}; login demo recusado" -f $disposition
+            }
+            [void]$script:runNotes.Add(("terminal64 {0}: {1}" -f $stem, $disposition))
+            if ($authStop) { throw "login demo recusado" }
+            if (-not $found) { throw ("P3: relatorio {0}.htm, {0}.html ou {0}.xml ausente" -f $stem) }
             return $found
           }
 
@@ -938,6 +1113,8 @@ jobs:
             }
           }
 
+          $script:runNotes = New-Object System.Collections.Generic.List[string]
+          $script:loginRecusado = $false
           try {
             Install-OfficialMt5
             $experts = Join-Path $Install "MQL5\Experts"
@@ -955,16 +1132,11 @@ jobs:
               throw "P3: compilacao nao aceite (exit=$code)"
             }
             Copy-Item $ex5 (Join-Path $OutDir "ForgeSynthMA.ex5") -Force
-            $report1 = Invoke-Tester "run1"
-            $report2 = Invoke-Tester "run2"
-            Copy-Item $report1 (Join-Path $OutDir "run1.htm") -Force
-            Copy-Item $report2 (Join-Path $OutDir "run2.htm") -Force
-            $m1 = Read-Metrics (Join-Path $OutDir "run1.htm")
-            $m2 = Read-Metrics (Join-Path $OutDir "run2.htm")
-            foreach ($copied in @((Join-Path $OutDir "run1.htm"), (Join-Path $OutDir "run2.htm"), $log)) {
-              $redacted = Hide (Read-TextFile $copied)
-              [System.IO.File]::WriteAllText($copied, $redacted, $utf8)
-            }
+            $report1 = Copy-Report (Invoke-Tester "run1") "run1"
+            $report2 = Copy-Report (Invoke-Tester "run2") "run2"
+            $m1 = Read-Metrics $report1
+            $m2 = Read-Metrics $report2
+            [System.IO.File]::WriteAllText($log, (Redact-Text (Read-TextFile $log)), $utf8)
             $payload1 = [ordered]@{
               run = "1"
               symbol = "EURUSD"
@@ -998,11 +1170,17 @@ jobs:
             [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), "p3: relatorios reproduzidos`n", $utf8)
           } catch {
             $failed = $true
-            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p3: falhou`n{0}`n" -f (Hide $_.Exception.Message)), $utf8)
-            Write-Output (Hide $_.Exception.Message)
+            $detail = (Redact-Text ([string]$_.Exception.Message)).Trim()
+            if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "erro sem detalhe redigido" }
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p3: falhou`n{0}`n" -f $detail), $utf8)
+            Write-Output $detail
           } finally {
-            Get-Process -Name terminal64,metatester64,metaeditor64 -ErrorAction SilentlyContinue |
+            Stop-TerminalProcesses
+            Get-Process -Name metaeditor64 -ErrorAction SilentlyContinue |
               Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            try { Write-P3Diagnostic } catch { Write-Output (Redact-Text ([string]$_.Exception.Message)) }
+            try { Redact-OutDir } catch { Write-Output (Redact-Text ([string]$_.Exception.Message)) }
             Write-Manifest $OutDir
             if (Test-Path $PrivateDir) {
               Remove-Item $PrivateDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -1044,6 +1222,17 @@ jobs:
             return $text
           }
           $OutDir = Join-Path (Get-Location) "artifacts\p3"
+          function Emit([string]$text) {
+            $hidden = Hide $text
+            foreach ($line in ($hidden -split '\r?\n')) {
+              $drop = $false
+              foreach ($secretName in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+                $value = [Environment]::GetEnvironmentVariable($secretName)
+                if (-not [string]::IsNullOrEmpty($value) -and $line.Contains($value)) { $drop = $true; break }
+              }
+              if (-not $drop) { Write-Output $line }
+            }
+          }
           function Show-Artifact([string]$name) {
             $path = Join-Path $OutDir $name
             Write-Output ("----- {0} -----" -f $name)
@@ -1052,8 +1241,9 @@ jobs:
               return
             }
             $bytes = [System.IO.File]::ReadAllBytes($path)
-            Write-Output (Hide ([System.Text.Encoding]::UTF8.GetString($bytes)))
+            Emit ([System.Text.Encoding]::UTF8.GetString($bytes))
           }
           Show-Artifact "installer-signature.txt"
           Show-Artifact "resultado.txt"
+          Show-Artifact "diagnostico.txt"
           Show-Artifact "MANIFEST.sha256"
