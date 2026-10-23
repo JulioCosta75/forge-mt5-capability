@@ -8,7 +8,6 @@ name: bancada
 
 permissions:
   contents: read
-  actions: write
 
 defaults:
   run:
@@ -72,13 +71,63 @@ jobs:
             New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
             $setup = Join-Path $setupDir "mt5setup.exe"
             $ProgressPreference = "SilentlyContinue"
-            Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing
-            $head = [System.IO.File]::ReadAllBytes($setup)
-            if ($head.Length -lt 2 -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
-              throw "P1: o ficheiro descarregado nao tem assinatura PE"
+            $response = Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing -PassThru
+            $effectiveUrl = $InstallerUrl
+            try {
+              if ($null -ne $response -and $null -ne $response.BaseResponse) {
+                $base = $response.BaseResponse
+                $candidate = $null
+                if ($null -ne $base.RequestMessage -and $null -ne $base.RequestMessage.RequestUri) {
+                  $candidate = [string]$base.RequestMessage.RequestUri.AbsoluteUri
+                }
+                if ([string]::IsNullOrWhiteSpace($candidate)) {
+                  $prop = $base.PSObject.Properties["ResponseUri"]
+                  if ($null -ne $prop -and $null -ne $prop.Value) {
+                    $candidate = [string]$prop.Value.AbsoluteUri
+                  }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $effectiveUrl = $candidate }
+              }
+            } catch {
+              $effectiveUrl = $InstallerUrl
             }
+            $head = [System.IO.File]::ReadAllBytes($setup)
+            $mzOk = ($head.Length -ge 2 -and $head[0] -eq 0x4D -and $head[1] -eq 0x5A)
             $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLowerInvariant()
+            $status = "indisponivel"
+            $subject = ""
+            $thumb = ""
+            try {
+              $sig = Get-AuthenticodeSignature -FilePath $setup
+              $status = [string]$sig.Status
+              if ($null -ne $sig.SignerCertificate) {
+                $subject = [string]$sig.SignerCertificate.Subject
+                $thumb = [string]$sig.SignerCertificate.Thumbprint
+              }
+            } catch {
+              $detail = [string]$_.Exception.Message
+              $detail = $detail -replace '\s+', ' '
+              if ($detail.Length -gt 180) { $detail = $detail.Substring(0, 180) }
+              $status = "erro: " + $detail
+            }
+            $subjectOk = $subject.Contains("MetaQuotes")
+            $sigBody = @(
+              ("sha256: {0}" -f $hash),
+              ("status: {0}" -f $status),
+              ("subject: {0}" -f $subject),
+              ("thumbprint: {0}" -f $thumb),
+              ("url: {0}" -f $effectiveUrl)
+            ) -join "`n"
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "installer-signature.txt"), ($sigBody + "`n"), $utf8)
             [System.IO.File]::WriteAllText((Join-Path $OutDir "installer.sha256"), ("{0}  mt5setup.exe`n" -f $hash), $utf8)
+            Write-Output "installer-signature:"
+            Write-Output $sigBody
+            if (-not $mzOk) {
+              throw "P1: o ficheiro descarregado nao tem assinatura PE; o instalador nao foi executado"
+            }
+            if ($status -ne "Valid" -or -not $subjectOk) {
+              throw "P1: assinatura Authenticode recusada; o instalador nao foi executado"
+            }
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $setup
             $psi.Arguments = "/auto /path:$Install"
@@ -186,6 +235,61 @@ jobs:
           path: artifacts/p1
           if-no-files-found: warn
 
+      - name: Evidencia no log
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $OutDir = Join-Path (Get-Location) "artifacts\p1"
+          function Show-Artifact([string]$name) {
+            $path = Join-Path $OutDir $name
+            Write-Output ("----- {0} -----" -f $name)
+            if (-not (Test-Path -LiteralPath $path)) {
+              Write-Output "ausente"
+              return
+            }
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            Write-Output ([System.Text.Encoding]::UTF8.GetString($bytes))
+          }
+          function Read-TextFile([string]$path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+              return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+            }
+            $pairs = 0
+            $zeros = 0
+            $limit = [Math]::Min(200, $bytes.Length)
+            for ($i = 1; $i -lt $limit; $i += 2) {
+              $pairs++
+              if ($bytes[$i] -eq 0) { $zeros++ }
+            }
+            if ($pairs -gt 20 -and $zeros -gt ($pairs * 0.6)) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            return [System.Text.Encoding]::UTF8.GetString($bytes)
+          }
+          Show-Artifact "installer-signature.txt"
+          Show-Artifact "resultado.txt"
+          Show-Artifact "MANIFEST.sha256"
+          $log = Join-Path $OutDir "ForgeSynthMA.log"
+          Write-Output "----- log compilacao (error|warning|result, max 50) -----"
+          if (-not (Test-Path -LiteralPath $log)) {
+            Write-Output "ausente"
+          } else {
+            $text = Read-TextFile $log
+            $hits = New-Object System.Collections.Generic.List[string]
+            foreach ($line in ($text -split '\r?\n')) {
+              if ($line -match '(?i)error|warning|result') { $hits.Add($line) }
+            }
+            $shown = [Math]::Min(50, $hits.Count)
+            for ($i = 0; $i -lt $shown; $i++) { Write-Output $hits[$i] }
+            if ($hits.Count -eq 0) { Write-Output "nenhuma linha" }
+            if ($hits.Count -gt 50) { Write-Output ("limite: 50 de {0}" -f $hits.Count) }
+          }
+
   P2:
     name: P2 erro detetado
     runs-on: windows-latest
@@ -243,13 +347,63 @@ jobs:
             New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
             $setup = Join-Path $setupDir "mt5setup.exe"
             $ProgressPreference = "SilentlyContinue"
-            Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing
-            $head = [System.IO.File]::ReadAllBytes($setup)
-            if ($head.Length -lt 2 -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
-              throw "P2: o ficheiro descarregado nao tem assinatura PE"
+            $response = Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing -PassThru
+            $effectiveUrl = $InstallerUrl
+            try {
+              if ($null -ne $response -and $null -ne $response.BaseResponse) {
+                $base = $response.BaseResponse
+                $candidate = $null
+                if ($null -ne $base.RequestMessage -and $null -ne $base.RequestMessage.RequestUri) {
+                  $candidate = [string]$base.RequestMessage.RequestUri.AbsoluteUri
+                }
+                if ([string]::IsNullOrWhiteSpace($candidate)) {
+                  $prop = $base.PSObject.Properties["ResponseUri"]
+                  if ($null -ne $prop -and $null -ne $prop.Value) {
+                    $candidate = [string]$prop.Value.AbsoluteUri
+                  }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $effectiveUrl = $candidate }
+              }
+            } catch {
+              $effectiveUrl = $InstallerUrl
             }
+            $head = [System.IO.File]::ReadAllBytes($setup)
+            $mzOk = ($head.Length -ge 2 -and $head[0] -eq 0x4D -and $head[1] -eq 0x5A)
             $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLowerInvariant()
+            $status = "indisponivel"
+            $subject = ""
+            $thumb = ""
+            try {
+              $sig = Get-AuthenticodeSignature -FilePath $setup
+              $status = [string]$sig.Status
+              if ($null -ne $sig.SignerCertificate) {
+                $subject = [string]$sig.SignerCertificate.Subject
+                $thumb = [string]$sig.SignerCertificate.Thumbprint
+              }
+            } catch {
+              $detail = [string]$_.Exception.Message
+              $detail = $detail -replace '\s+', ' '
+              if ($detail.Length -gt 180) { $detail = $detail.Substring(0, 180) }
+              $status = "erro: " + $detail
+            }
+            $subjectOk = $subject.Contains("MetaQuotes")
+            $sigBody = @(
+              ("sha256: {0}" -f $hash),
+              ("status: {0}" -f $status),
+              ("subject: {0}" -f $subject),
+              ("thumbprint: {0}" -f $thumb),
+              ("url: {0}" -f $effectiveUrl)
+            ) -join "`n"
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "installer-signature.txt"), ($sigBody + "`n"), $utf8)
             [System.IO.File]::WriteAllText((Join-Path $OutDir "installer.sha256"), ("{0}  mt5setup.exe`n" -f $hash), $utf8)
+            Write-Output "installer-signature:"
+            Write-Output $sigBody
+            if (-not $mzOk) {
+              throw "P2: o ficheiro descarregado nao tem assinatura PE; o instalador nao foi executado"
+            }
+            if ($status -ne "Valid" -or -not $subjectOk) {
+              throw "P2: assinatura Authenticode recusada; o instalador nao foi executado"
+            }
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $setup
             $psi.Arguments = "/auto /path:$Install"
@@ -358,6 +512,61 @@ jobs:
           name: p2-erro
           path: artifacts/p2
           if-no-files-found: warn
+
+      - name: Evidencia no log
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $OutDir = Join-Path (Get-Location) "artifacts\p2"
+          function Show-Artifact([string]$name) {
+            $path = Join-Path $OutDir $name
+            Write-Output ("----- {0} -----" -f $name)
+            if (-not (Test-Path -LiteralPath $path)) {
+              Write-Output "ausente"
+              return
+            }
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            Write-Output ([System.Text.Encoding]::UTF8.GetString($bytes))
+          }
+          function Read-TextFile([string]$path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+              return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+            }
+            $pairs = 0
+            $zeros = 0
+            $limit = [Math]::Min(200, $bytes.Length)
+            for ($i = 1; $i -lt $limit; $i += 2) {
+              $pairs++
+              if ($bytes[$i] -eq 0) { $zeros++ }
+            }
+            if ($pairs -gt 20 -and $zeros -gt ($pairs * 0.6)) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            return [System.Text.Encoding]::UTF8.GetString($bytes)
+          }
+          Show-Artifact "installer-signature.txt"
+          Show-Artifact "resultado.txt"
+          Show-Artifact "MANIFEST.sha256"
+          $log = Join-Path $OutDir "ForgeSynthMA_erro.log"
+          Write-Output "----- log compilacao (error|warning|result, max 50) -----"
+          if (-not (Test-Path -LiteralPath $log)) {
+            Write-Output "ausente"
+          } else {
+            $text = Read-TextFile $log
+            $hits = New-Object System.Collections.Generic.List[string]
+            foreach ($line in ($text -split '\r?\n')) {
+              if ($line -match '(?i)error|warning|result') { $hits.Add($line) }
+            }
+            $shown = [Math]::Min(50, $hits.Count)
+            for ($i = 0; $i -lt $shown; $i++) { Write-Output $hits[$i] }
+            if ($hits.Count -eq 0) { Write-Output "nenhuma linha" }
+            if ($hits.Count -gt 50) { Write-Output ("limite: 50 de {0}" -f $hits.Count) }
+          }
 
   P3:
     name: P3 strategy tester
@@ -473,13 +682,64 @@ jobs:
             New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
             $setup = Join-Path $setupDir "mt5setup.exe"
             $ProgressPreference = "SilentlyContinue"
-            Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing
-            $head = [System.IO.File]::ReadAllBytes($setup)
-            if ($head.Length -lt 2 -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
-              throw "P3: o ficheiro descarregado nao tem assinatura PE"
+            $response = Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing -PassThru
+            $effectiveUrl = $InstallerUrl
+            try {
+              if ($null -ne $response -and $null -ne $response.BaseResponse) {
+                $base = $response.BaseResponse
+                $candidate = $null
+                if ($null -ne $base.RequestMessage -and $null -ne $base.RequestMessage.RequestUri) {
+                  $candidate = [string]$base.RequestMessage.RequestUri.AbsoluteUri
+                }
+                if ([string]::IsNullOrWhiteSpace($candidate)) {
+                  $prop = $base.PSObject.Properties["ResponseUri"]
+                  if ($null -ne $prop -and $null -ne $prop.Value) {
+                    $candidate = [string]$prop.Value.AbsoluteUri
+                  }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $effectiveUrl = $candidate }
+              }
+            } catch {
+              $effectiveUrl = $InstallerUrl
             }
+            $head = [System.IO.File]::ReadAllBytes($setup)
+            $mzOk = ($head.Length -ge 2 -and $head[0] -eq 0x4D -and $head[1] -eq 0x5A)
             $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLowerInvariant()
+            $status = "indisponivel"
+            $subject = ""
+            $thumb = ""
+            try {
+              $sig = Get-AuthenticodeSignature -FilePath $setup
+              $status = [string]$sig.Status
+              if ($null -ne $sig.SignerCertificate) {
+                $subject = [string]$sig.SignerCertificate.Subject
+                $thumb = [string]$sig.SignerCertificate.Thumbprint
+              }
+            } catch {
+              $detail = Hide ([string]$_.Exception.Message)
+              $detail = $detail -replace '\s+', ' '
+              if ($detail.Length -gt 180) { $detail = $detail.Substring(0, 180) }
+              $status = "erro: " + $detail
+            }
+            $subjectOk = $subject.Contains("MetaQuotes")
+            $sigBody = @(
+              ("sha256: {0}" -f $hash),
+              ("status: {0}" -f $status),
+              ("subject: {0}" -f $subject),
+              ("thumbprint: {0}" -f $thumb),
+              ("url: {0}" -f $effectiveUrl)
+            ) -join "`n"
+            $sigText = Hide ($sigBody + "`n")
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "installer-signature.txt"), $sigText, $utf8)
             [System.IO.File]::WriteAllText((Join-Path $OutDir "installer.sha256"), ("{0}  mt5setup.exe`n" -f $hash), $utf8)
+            Write-Output "installer-signature:"
+            Write-Output $sigText
+            if (-not $mzOk) {
+              throw "P3: o ficheiro descarregado nao tem assinatura PE; o instalador nao foi executado"
+            }
+            if ($status -ne "Valid" -or -not $subjectOk) {
+              throw "P3: assinatura Authenticode recusada; o instalador nao foi executado"
+            }
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $setup
             $psi.Arguments = "/auto /path:$Install"
@@ -757,3 +1017,43 @@ jobs:
           name: p3-strategy-tester
           path: artifacts/p3
           if-no-files-found: warn
+
+      - name: Evidencia no log
+        if: always()
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          foreach ($name in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not [string]::IsNullOrEmpty($value)) {
+              Write-Output ("::add-mask::{0}" -f $value)
+            }
+          }
+          function Hide([string]$text) {
+            if ($null -eq $text) { return "" }
+            foreach ($name in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+              $value = [Environment]::GetEnvironmentVariable($name)
+              if (-not [string]::IsNullOrEmpty($value) -and $value.Length -ge 3) {
+                $text = $text.Replace($value, "[redacted]")
+              }
+            }
+            return $text
+          }
+          $OutDir = Join-Path (Get-Location) "artifacts\p3"
+          function Show-Artifact([string]$name) {
+            $path = Join-Path $OutDir $name
+            Write-Output ("----- {0} -----" -f $name)
+            if (-not (Test-Path -LiteralPath $path)) {
+              Write-Output "ausente"
+              return
+            }
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            Write-Output (Hide ([System.Text.Encoding]::UTF8.GetString($bytes)))
+          }
+          Show-Artifact "installer-signature.txt"
+          Show-Artifact "resultado.txt"
+          Show-Artifact "MANIFEST.sha256"
