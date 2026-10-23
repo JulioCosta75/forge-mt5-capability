@@ -1041,7 +1041,8 @@ jobs:
               }
               $ext = $file.Extension.ToLowerInvariant()
               if ($allowed -notcontains $ext) { continue }
-              $null = Try-SanitizeFile $file.FullName
+              $state = Try-SanitizeFile $file.FullName
+              if ($state -eq "removed") { $script:redactionRemoved = $true }
             }
           }
 
@@ -1285,6 +1286,7 @@ jobs:
           $script:runStarts = New-Object System.Collections.Generic.List[object]
           $script:loginRecusado = $false
           $script:redactionUnsafe = $false
+          $script:redactionRemoved = $false
           try {
             Install-OfficialMt5
             $experts = Join-Path $Install "MQL5\Experts"
@@ -1396,6 +1398,12 @@ jobs:
                 Write-Output "P3: upload do artefacto bloqueado"
               }
             } else {
+              if ($script:redactionRemoved) {
+                $failed = $true
+                [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), "p3: falhou`nredacao removeu ficheiro do artefacto`n", $utf8)
+                Write-Output "p3: falhou"
+                Write-Output "redacao removeu ficheiro do artefacto"
+              }
               Write-Manifest $OutDir
             }
             if (Test-Path $PrivateDir) {
