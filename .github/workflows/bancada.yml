@@ -1,0 +1,759 @@
+# Árvore da raiz de JulioCosta75/forge-mt5-capability depois da transferência.
+# Neste orchestrator o ficheiro está em mt5-bancada/ e o Actions daqui não o executa.
+name: bancada
+
+"on":
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  P1:
+    name: P1 compilacao
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Obter o codigo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Compilar ForgeSynthMA
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $InstallerUrl = "https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/mt5setup.exe?utm_source=www.metatrader5.com&utm_campaign=download"
+          $Install = "C:\mt5-bancada"
+          $OutDir = Join-Path (Get-Location) "artifacts\p1"
+          New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+          $failed = $false
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+
+          function Write-Manifest([string]$dir) {
+            $manifest = Join-Path $dir "MANIFEST.sha256"
+            if (Test-Path $manifest) { Remove-Item $manifest -Force }
+            $files = @(Get-ChildItem -Path $dir -File | Where-Object { $_.Name -ne "MANIFEST.sha256" } | Sort-Object Name)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($file in $files) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path $file.FullName).Hash.ToLowerInvariant()
+              [void]$sb.AppendLine(("{0}  {1}" -f $hash, $file.Name))
+            }
+            [System.IO.File]::WriteAllText($manifest, $sb.ToString(), $utf8)
+          }
+
+          function Read-TextFile([string]$path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+              return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+            }
+            $pairs = 0
+            $zeros = 0
+            $limit = [Math]::Min(200, $bytes.Length)
+            for ($i = 1; $i -lt $limit; $i += 2) {
+              $pairs++
+              if ($bytes[$i] -eq 0) { $zeros++ }
+            }
+            if ($pairs -gt 20 -and $zeros -gt ($pairs * 0.6)) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            return [System.Text.Encoding]::UTF8.GetString($bytes)
+          }
+
+          function Install-OfficialMt5 {
+            $setupDir = "C:\mt5-bancada-setup"
+            New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
+            $setup = Join-Path $setupDir "mt5setup.exe"
+            $ProgressPreference = "SilentlyContinue"
+            Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing
+            $head = [System.IO.File]::ReadAllBytes($setup)
+            if ($head.Length -lt 2 -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+              throw "P1: o ficheiro descarregado nao tem assinatura PE"
+            }
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "installer.sha256"), ("{0}  mt5setup.exe`n" -f $hash), $utf8)
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $setup
+            $psi.Arguments = "/auto /path:$Install"
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            $deadline = (Get-Date).AddMinutes(15)
+            $editor = Join-Path $Install "metaeditor64.exe"
+            $terminal = Join-Path $Install "terminal64.exe"
+            foreach ($path in @($editor, $terminal)) {
+              $last = [int64]-1
+              $stable = 0
+              $ready = $false
+              while ((Get-Date) -lt $deadline) {
+                if (Test-Path $path) {
+                  $len = [int64](Get-Item $path).Length
+                  if ($len -gt 1000000 -and $len -eq $last) {
+                    $stable++
+                    if ($stable -ge 3) { $ready = $true; break }
+                  } else { $stable = 0 }
+                  $last = $len
+                } else { $stable = 0; $last = [int64]-1 }
+                Start-Sleep -Seconds 5
+              }
+              if (-not $ready) { throw "P1: $path nao ficou pronto" }
+            }
+            Get-Process -Name mt5setup,terminal64,metaeditor64,metatester64 -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item $setup -Force
+            $listing = @(Get-ChildItem -Path $Install | Select-Object -ExpandProperty Name)
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "install-dir.txt"), (($listing -join "`n") + "`n"), $utf8)
+          }
+
+          function Invoke-MetaEditor([string]$source, [string]$logPath) {
+            $editor = Join-Path $Install "metaeditor64.exe"
+            $include = Join-Path $Install "MQL5"
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $editor
+            $psi.Arguments = '/compile:"{0}" /log:"{1}" /include:"{2}"' -f $source, $logPath, $include
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            [void]$proc.WaitForExit()
+            $sibling = Join-Path (Split-Path $source -Parent) (([System.IO.Path]::GetFileNameWithoutExtension($source)) + ".log")
+            $logDeadline = (Get-Date).AddSeconds(60)
+            $lastLen = [int64]-1
+            $stableLen = 0
+            while ((Get-Date) -lt $logDeadline) {
+              $candidate = $null
+              if (Test-Path $logPath) { $candidate = $logPath }
+              elseif (Test-Path $sibling) { $candidate = $sibling }
+              if ($candidate) {
+                $len = [int64](Get-Item $candidate).Length
+                if ($len -gt 0 -and $len -eq $lastLen) {
+                  $stableLen++
+                  if ($stableLen -ge 2) { break }
+                } else { $stableLen = 0 }
+                $lastLen = $len
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not (Test-Path $logPath) -and (Test-Path $sibling)) {
+              Copy-Item $sibling $logPath -Force
+            }
+            if (-not (Test-Path $logPath)) { throw "P1: log de compilacao ausente" }
+            return [int]$proc.ExitCode
+          }
+
+          try {
+            Install-OfficialMt5
+            $experts = Join-Path $Install "MQL5\Experts"
+            New-Item -ItemType Directory -Force -Path $experts | Out-Null
+            $source = Join-Path $experts "ForgeSynthMA.mq5"
+            Copy-Item (Join-Path (Get-Location) "ea\ForgeSynthMA.mq5") $source -Force
+            $log = Join-Path $OutDir "ForgeSynthMA.log"
+            $code = Invoke-MetaEditor $source $log
+            $text = Read-TextFile $log
+            $zero = $text -match '(?i)\b0\s+errors?\b'
+            $positive = $text -match '(?i)(?<![\d])[1-9]\d*\s+errors?\b'
+            $ex5 = Join-Path $experts "ForgeSynthMA.ex5"
+            $ex5ok = (Test-Path $ex5) -and ((Get-Item $ex5).Length -gt 0)
+            if (-not $zero -or $positive -or -not $ex5ok) {
+              throw "P1: compilacao nao aceite (exit=$code)"
+            }
+            Copy-Item $ex5 (Join-Path $OutDir "ForgeSynthMA.ex5") -Force
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p1: compilacao aceite`nexit: {0}`n" -f $code), $utf8)
+          } catch {
+            $failed = $true
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p1: falhou`n{0}`n" -f $_.Exception.Message), $utf8)
+            Write-Output $_.Exception.Message
+          } finally {
+            Write-Manifest $OutDir
+          }
+          if ($failed) { exit 1 }
+
+      - name: Artefactos P1
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p1-compilacao
+          path: artifacts/p1
+          if-no-files-found: warn
+
+  P2:
+    name: P2 erro detetado
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Obter o codigo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Compilar ForgeSynthMA_erro
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $InstallerUrl = "https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/mt5setup.exe?utm_source=www.metatrader5.com&utm_campaign=download"
+          $Install = "C:\mt5-bancada"
+          $OutDir = Join-Path (Get-Location) "artifacts\p2"
+          New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+          $failed = $false
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+
+          function Write-Manifest([string]$dir) {
+            $manifest = Join-Path $dir "MANIFEST.sha256"
+            if (Test-Path $manifest) { Remove-Item $manifest -Force }
+            $files = @(Get-ChildItem -Path $dir -File | Where-Object { $_.Name -ne "MANIFEST.sha256" } | Sort-Object Name)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($file in $files) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path $file.FullName).Hash.ToLowerInvariant()
+              [void]$sb.AppendLine(("{0}  {1}" -f $hash, $file.Name))
+            }
+            [System.IO.File]::WriteAllText($manifest, $sb.ToString(), $utf8)
+          }
+
+          function Read-TextFile([string]$path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+              return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+            }
+            $pairs = 0
+            $zeros = 0
+            $limit = [Math]::Min(200, $bytes.Length)
+            for ($i = 1; $i -lt $limit; $i += 2) {
+              $pairs++
+              if ($bytes[$i] -eq 0) { $zeros++ }
+            }
+            if ($pairs -gt 20 -and $zeros -gt ($pairs * 0.6)) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            return [System.Text.Encoding]::UTF8.GetString($bytes)
+          }
+
+          function Install-OfficialMt5 {
+            $setupDir = "C:\mt5-bancada-setup"
+            New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
+            $setup = Join-Path $setupDir "mt5setup.exe"
+            $ProgressPreference = "SilentlyContinue"
+            Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing
+            $head = [System.IO.File]::ReadAllBytes($setup)
+            if ($head.Length -lt 2 -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+              throw "P2: o ficheiro descarregado nao tem assinatura PE"
+            }
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "installer.sha256"), ("{0}  mt5setup.exe`n" -f $hash), $utf8)
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $setup
+            $psi.Arguments = "/auto /path:$Install"
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            $deadline = (Get-Date).AddMinutes(15)
+            $editor = Join-Path $Install "metaeditor64.exe"
+            $terminal = Join-Path $Install "terminal64.exe"
+            foreach ($path in @($editor, $terminal)) {
+              $last = [int64]-1
+              $stable = 0
+              $ready = $false
+              while ((Get-Date) -lt $deadline) {
+                if (Test-Path $path) {
+                  $len = [int64](Get-Item $path).Length
+                  if ($len -gt 1000000 -and $len -eq $last) {
+                    $stable++
+                    if ($stable -ge 3) { $ready = $true; break }
+                  } else { $stable = 0 }
+                  $last = $len
+                } else { $stable = 0; $last = [int64]-1 }
+                Start-Sleep -Seconds 5
+              }
+              if (-not $ready) { throw "P2: $path nao ficou pronto" }
+            }
+            Get-Process -Name mt5setup,terminal64,metaeditor64,metatester64 -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item $setup -Force
+            $listing = @(Get-ChildItem -Path $Install | Select-Object -ExpandProperty Name)
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "install-dir.txt"), (($listing -join "`n") + "`n"), $utf8)
+          }
+
+          function Invoke-MetaEditor([string]$source, [string]$logPath) {
+            $editor = Join-Path $Install "metaeditor64.exe"
+            $include = Join-Path $Install "MQL5"
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $editor
+            $psi.Arguments = '/compile:"{0}" /log:"{1}" /include:"{2}"' -f $source, $logPath, $include
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            [void]$proc.WaitForExit()
+            $sibling = Join-Path (Split-Path $source -Parent) (([System.IO.Path]::GetFileNameWithoutExtension($source)) + ".log")
+            $logDeadline = (Get-Date).AddSeconds(60)
+            $lastLen = [int64]-1
+            $stableLen = 0
+            while ((Get-Date) -lt $logDeadline) {
+              $candidate = $null
+              if (Test-Path $logPath) { $candidate = $logPath }
+              elseif (Test-Path $sibling) { $candidate = $sibling }
+              if ($candidate) {
+                $len = [int64](Get-Item $candidate).Length
+                if ($len -gt 0 -and $len -eq $lastLen) {
+                  $stableLen++
+                  if ($stableLen -ge 2) { break }
+                } else { $stableLen = 0 }
+                $lastLen = $len
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not (Test-Path $logPath) -and (Test-Path $sibling)) {
+              Copy-Item $sibling $logPath -Force
+            }
+            if (-not (Test-Path $logPath)) { throw "P2: log de compilacao ausente" }
+            return [int]$proc.ExitCode
+          }
+
+          try {
+            Install-OfficialMt5
+            $experts = Join-Path $Install "MQL5\Experts"
+            New-Item -ItemType Directory -Force -Path $experts | Out-Null
+            $source = Join-Path $experts "ForgeSynthMA_erro.mq5"
+            Copy-Item (Join-Path (Get-Location) "ea\ForgeSynthMA_erro.mq5") $source -Force
+            $log = Join-Path $OutDir "ForgeSynthMA_erro.log"
+            $code = Invoke-MetaEditor $source $log
+            $text = Read-TextFile $log
+            $positive = $text -match '(?i)(?<![\d])[1-9]\d*\s+errors?\b'
+            $colon = $text -match '(?i):\s*error\b'
+            $detected = ($code -ne 0) -or $positive -or $colon
+            $ex5 = Join-Path $experts "ForgeSynthMA_erro.ex5"
+            if ((Test-Path $ex5) -and ((Get-Item $ex5).Length -gt 0)) {
+              throw "P2: o compilador produziu ex5 (exit=$code)"
+            }
+            if (-not $detected) {
+              throw "P2: falha de compilacao nao detetada (exit=$code)"
+            }
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p2: erro detetado`nexit: {0}`n" -f $code), $utf8)
+          } catch {
+            $failed = $true
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p2: falhou`n{0}`n" -f $_.Exception.Message), $utf8)
+            Write-Output $_.Exception.Message
+          } finally {
+            Write-Manifest $OutDir
+          }
+          if ($failed) { exit 1 }
+
+      - name: Artefactos P2
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2-erro
+          path: artifacts/p2
+          if-no-files-found: warn
+
+  P3:
+    name: P3 strategy tester
+    runs-on: windows-latest
+    timeout-minutes: 70
+    steps:
+      - name: Obter o codigo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Verificar segredos demo
+        id: demo
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not [string]::IsNullOrEmpty($value)) {
+              Write-Output ("::add-mask::{0}" -f $value)
+            }
+          }
+          $login = [Environment]::GetEnvironmentVariable("MT5_DEMO_LOGIN")
+          $password = [Environment]::GetEnvironmentVariable("MT5_DEMO_PASSWORD")
+          $server = [Environment]::GetEnvironmentVariable("MT5_DEMO_SERVER")
+          $missing = [string]::IsNullOrWhiteSpace($login) -or [string]::IsNullOrWhiteSpace($password) -or [string]::IsNullOrWhiteSpace($server)
+          $outDir = Join-Path (Get-Location) "artifacts\p3"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          if ($missing) {
+            $utf8 = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText((Join-Path $outDir "resultado.txt"), "skipped: demo secrets ausentes`n", $utf8)
+            $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $outDir "resultado.txt")).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText((Join-Path $outDir "MANIFEST.sha256"), ("{0}  resultado.txt`n" -f $hash), $utf8)
+            Write-Output "skipped: demo secrets ausentes"
+            "skipped=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "segredos demo presentes"
+            "skipped=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Strategy Tester
+        if: steps.demo.outputs.skipped == 'false'
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not [string]::IsNullOrEmpty($value)) {
+              Write-Output ("::add-mask::{0}" -f $value)
+            }
+          }
+          $InstallerUrl = "https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/mt5setup.exe?utm_source=www.metatrader5.com&utm_campaign=download"
+          $Install = "C:\mt5-bancada"
+          $OutDir = Join-Path (Get-Location) "artifacts\p3"
+          $PrivateDir = "C:\bancada-private"
+          New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $PrivateDir | Out-Null
+          $failed = $false
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+
+          function Hide([string]$text) {
+            if ($null -eq $text) { return $text }
+            foreach ($name in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
+              $value = [Environment]::GetEnvironmentVariable($name)
+              if (-not [string]::IsNullOrEmpty($value) -and $value.Length -ge 3) {
+                $text = $text.Replace($value, "[redacted]")
+              }
+            }
+            return $text
+          }
+
+          function Write-Manifest([string]$dir) {
+            $manifest = Join-Path $dir "MANIFEST.sha256"
+            if (Test-Path $manifest) { Remove-Item $manifest -Force }
+            $files = @(Get-ChildItem -Path $dir -File | Where-Object { $_.Name -ne "MANIFEST.sha256" } | Sort-Object Name)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($file in $files) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path $file.FullName).Hash.ToLowerInvariant()
+              [void]$sb.AppendLine(("{0}  {1}" -f $hash, $file.Name))
+            }
+            [System.IO.File]::WriteAllText($manifest, $sb.ToString(), $utf8)
+          }
+
+          function Read-TextFile([string]$path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+              return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+            }
+            $pairs = 0
+            $zeros = 0
+            $limit = [Math]::Min(200, $bytes.Length)
+            for ($i = 1; $i -lt $limit; $i += 2) {
+              $pairs++
+              if ($bytes[$i] -eq 0) { $zeros++ }
+            }
+            if ($pairs -gt 20 -and $zeros -gt ($pairs * 0.6)) {
+              return [System.Text.Encoding]::Unicode.GetString($bytes)
+            }
+            return [System.Text.Encoding]::UTF8.GetString($bytes)
+          }
+
+          function Install-OfficialMt5 {
+            $setupDir = "C:\mt5-bancada-setup"
+            New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
+            $setup = Join-Path $setupDir "mt5setup.exe"
+            $ProgressPreference = "SilentlyContinue"
+            Invoke-WebRequest -Uri $InstallerUrl -OutFile $setup -UseBasicParsing
+            $head = [System.IO.File]::ReadAllBytes($setup)
+            if ($head.Length -lt 2 -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+              throw "P3: o ficheiro descarregado nao tem assinatura PE"
+            }
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "installer.sha256"), ("{0}  mt5setup.exe`n" -f $hash), $utf8)
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $setup
+            $psi.Arguments = "/auto /path:$Install"
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            $deadline = (Get-Date).AddMinutes(15)
+            $editor = Join-Path $Install "metaeditor64.exe"
+            $terminal = Join-Path $Install "terminal64.exe"
+            foreach ($path in @($editor, $terminal)) {
+              $last = [int64]-1
+              $stable = 0
+              $ready = $false
+              while ((Get-Date) -lt $deadline) {
+                if (Test-Path $path) {
+                  $len = [int64](Get-Item $path).Length
+                  if ($len -gt 1000000 -and $len -eq $last) {
+                    $stable++
+                    if ($stable -ge 3) { $ready = $true; break }
+                  } else { $stable = 0 }
+                  $last = $len
+                } else { $stable = 0; $last = [int64]-1 }
+                Start-Sleep -Seconds 5
+              }
+              if (-not $ready) { throw "P3: $path nao ficou pronto" }
+            }
+            Get-Process -Name mt5setup,terminal64,metaeditor64,metatester64 -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item $setup -Force
+            $listing = @(Get-ChildItem -Path $Install | Select-Object -ExpandProperty Name)
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "install-dir.txt"), (($listing -join "`n") + "`n"), $utf8)
+          }
+
+          function Invoke-MetaEditor([string]$source, [string]$logPath) {
+            $editor = Join-Path $Install "metaeditor64.exe"
+            $include = Join-Path $Install "MQL5"
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $editor
+            $psi.Arguments = '/compile:"{0}" /log:"{1}" /include:"{2}"' -f $source, $logPath, $include
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            [void]$proc.WaitForExit()
+            $sibling = Join-Path (Split-Path $source -Parent) (([System.IO.Path]::GetFileNameWithoutExtension($source)) + ".log")
+            $logDeadline = (Get-Date).AddSeconds(60)
+            $lastLen = [int64]-1
+            $stableLen = 0
+            while ((Get-Date) -lt $logDeadline) {
+              $candidate = $null
+              if (Test-Path $logPath) { $candidate = $logPath }
+              elseif (Test-Path $sibling) { $candidate = $sibling }
+              if ($candidate) {
+                $len = [int64](Get-Item $candidate).Length
+                if ($len -gt 0 -and $len -eq $lastLen) {
+                  $stableLen++
+                  if ($stableLen -ge 2) { break }
+                } else { $stableLen = 0 }
+                $lastLen = $len
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not (Test-Path $logPath) -and (Test-Path $sibling)) {
+              Copy-Item $sibling $logPath -Force
+            }
+            if (-not (Test-Path $logPath)) { throw "P3: log de compilacao ausente" }
+            return [int]$proc.ExitCode
+          }
+
+          function Get-LabeledValue([string]$text, [string]$label) {
+            $plain = $text.Replace("&nbsp;", " ").Replace("&#160;", " ")
+            $plain = [regex]::Replace($plain, "(?is)<script.*?</script>", " ")
+            $plain = [regex]::Replace($plain, "(?s)<[^>]+>", "`n")
+            $lines = New-Object System.Collections.Generic.List[string]
+            foreach ($part in ($plain -split "`n")) {
+              $trim = $part.Trim()
+              if ($trim.Length -gt 0) { $lines.Add($trim) }
+            }
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              $line = $lines[$i]
+              $bare = $line.TrimEnd(":").Trim()
+              if ([string]::Equals($bare, $label, [System.StringComparison]::OrdinalIgnoreCase)) {
+                if ($i + 1 -lt $lines.Count) { return $lines[$i + 1] }
+                return $null
+              }
+              $prefix = $label + ":"
+              if ($line.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $line.Substring($prefix.Length).Trim()
+              }
+            }
+            return $null
+          }
+
+          function Find-Report([string]$name) {
+            $roots = @($Install, (Join-Path $env:APPDATA "MetaQuotes"))
+            foreach ($root in $roots) {
+              if (-not (Test-Path $root)) { continue }
+              $hit = Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($hit) { return $hit.FullName }
+            }
+            return $null
+          }
+
+          function Write-TesterIni([string]$path, [string]$stem) {
+            $login = [Environment]::GetEnvironmentVariable("MT5_DEMO_LOGIN")
+            $password = [Environment]::GetEnvironmentVariable("MT5_DEMO_PASSWORD")
+            $server = [Environment]::GetEnvironmentVariable("MT5_DEMO_SERVER")
+            $lines = @(
+              "[Common]",
+              ("Login={0}" -f $login),
+              ("Password={0}" -f $password),
+              ("Server={0}" -f $server),
+              "ProxyEnable=0",
+              "NewsEnable=0",
+              "",
+              "[Experts]",
+              "AllowLiveTrading=0",
+              "AllowDllImport=0",
+              "Enabled=1",
+              "",
+              "[Tester]",
+              "Expert=ForgeSynthMA",
+              "Symbol=EURUSD",
+              "Period=H1",
+              "Model=1",
+              "ExecutionMode=0",
+              "Optimization=0",
+              "FromDate=2024.01.02",
+              "ToDate=2024.02.02",
+              "ForwardMode=0",
+              "Deposit=10000",
+              "Currency=USD",
+              "Leverage=1:100",
+              "UseLocal=1",
+              "UseRemote=0",
+              "UseCloud=0",
+              "Visual=0",
+              ("Report=reports\{0}" -f $stem),
+              "ReplaceReport=1",
+              "ShutdownTerminal=1"
+            )
+            [System.IO.File]::WriteAllLines($path, $lines, $utf8)
+          }
+
+          function Invoke-Tester([string]$stem) {
+            $ini = Join-Path $PrivateDir "$stem.ini"
+            New-Item -ItemType Directory -Force -Path (Join-Path $Install "reports") | Out-Null
+            Write-TesterIni $ini $stem
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Join-Path $Install "terminal64.exe"
+            $psi.Arguments = "/portable /config:$ini"
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            $deadline = (Get-Date).AddMinutes(20)
+            $found = $null
+            while ((Get-Date) -lt $deadline) {
+              $found = Find-Report "$stem.htm"
+              $running = @(Get-Process -Name terminal64,metatester64 -ErrorAction SilentlyContinue)
+              if ($found -and $running.Count -eq 0) { break }
+              if ($proc.HasExited -and $found) { break }
+              Start-Sleep -Seconds 5
+            }
+            Get-Process -Name terminal64,metatester64 -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            if (-not $found) { $found = Find-Report "$stem.htm" }
+            if (-not $found) { throw "P3: relatorio $stem.htm ausente" }
+            return $found
+          }
+
+          function Read-Metrics([string]$path) {
+            $text = Read-TextFile $path
+            $profit = Get-LabeledValue $text "Total Net Profit"
+            $trades = Get-LabeledValue $text "Total Trades"
+            $draw = Get-LabeledValue $text "Equity Drawdown Maximal"
+            $label = "Equity Drawdown Maximal"
+            if ([string]::IsNullOrWhiteSpace($draw)) {
+              $draw = Get-LabeledValue $text "Balance Drawdown Maximal"
+              $label = "Balance Drawdown Maximal"
+            }
+            if ([string]::IsNullOrWhiteSpace($profit) -or [string]::IsNullOrWhiteSpace($trades) -or [string]::IsNullOrWhiteSpace($draw)) {
+              throw "P3: relatorio sem profit, trades ou drawdown"
+            }
+            return [pscustomobject]@{
+              profit = (Hide $profit)
+              trades = (Hide $trades)
+              drawdown = (Hide $draw)
+              drawdown_label = $label
+            }
+          }
+
+          try {
+            Install-OfficialMt5
+            $experts = Join-Path $Install "MQL5\Experts"
+            New-Item -ItemType Directory -Force -Path $experts | Out-Null
+            $source = Join-Path $experts "ForgeSynthMA.mq5"
+            Copy-Item (Join-Path (Get-Location) "ea\ForgeSynthMA.mq5") $source -Force
+            $log = Join-Path $OutDir "ForgeSynthMA.log"
+            $code = Invoke-MetaEditor $source $log
+            $text = Read-TextFile $log
+            $zero = $text -match '(?i)\b0\s+errors?\b'
+            $positive = $text -match '(?i)(?<![\d])[1-9]\d*\s+errors?\b'
+            $ex5 = Join-Path $experts "ForgeSynthMA.ex5"
+            $ex5ok = (Test-Path $ex5) -and ((Get-Item $ex5).Length -gt 0)
+            if (-not $zero -or $positive -or -not $ex5ok) {
+              throw "P3: compilacao nao aceite (exit=$code)"
+            }
+            Copy-Item $ex5 (Join-Path $OutDir "ForgeSynthMA.ex5") -Force
+            $report1 = Invoke-Tester "run1"
+            $report2 = Invoke-Tester "run2"
+            Copy-Item $report1 (Join-Path $OutDir "run1.htm") -Force
+            Copy-Item $report2 (Join-Path $OutDir "run2.htm") -Force
+            $m1 = Read-Metrics (Join-Path $OutDir "run1.htm")
+            $m2 = Read-Metrics (Join-Path $OutDir "run2.htm")
+            foreach ($copied in @((Join-Path $OutDir "run1.htm"), (Join-Path $OutDir "run2.htm"), $log)) {
+              $redacted = Hide (Read-TextFile $copied)
+              [System.IO.File]::WriteAllText($copied, $redacted, $utf8)
+            }
+            $payload1 = [ordered]@{
+              run = "1"
+              symbol = "EURUSD"
+              period = "H1"
+              model = 1
+              from = "2024.01.02"
+              to = "2024.02.02"
+              trades = $m1.trades
+              profit = $m1.profit
+              drawdown = $m1.drawdown
+              drawdown_label = $m1.drawdown_label
+            }
+            $payload2 = [ordered]@{
+              run = "2"
+              symbol = "EURUSD"
+              period = "H1"
+              model = 1
+              from = "2024.01.02"
+              to = "2024.02.02"
+              trades = $m2.trades
+              profit = $m2.profit
+              drawdown = $m2.drawdown
+              drawdown_label = $m2.drawdown_label
+            }
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "run1.json"), (($payload1 | ConvertTo-Json) + "`n"), $utf8)
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "run2.json"), (($payload2 | ConvertTo-Json) + "`n"), $utf8)
+            $same = ($m1.trades -eq $m2.trades) -and ($m1.profit -eq $m2.profit) -and ($m1.drawdown -eq $m2.drawdown) -and ($m1.drawdown_label -eq $m2.drawdown_label)
+            $cmp = [ordered]@{ equal = [bool]$same; trades = $m1.trades; profit = $m1.profit; drawdown = $m1.drawdown }
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "comparacao.json"), (($cmp | ConvertTo-Json) + "`n"), $utf8)
+            if (-not $same) { throw "P3: os dois runs nao reproduziram profit, trades e drawdown" }
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), "p3: relatorios reproduzidos`n", $utf8)
+          } catch {
+            $failed = $true
+            [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), ("p3: falhou`n{0}`n" -f (Hide $_.Exception.Message)), $utf8)
+            Write-Output (Hide $_.Exception.Message)
+          } finally {
+            Get-Process -Name terminal64,metatester64,metaeditor64 -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Manifest $OutDir
+            if (Test-Path $PrivateDir) {
+              Remove-Item $PrivateDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Artefactos P3
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p3-strategy-tester
+          path: artifacts/p3
+          if-no-files-found: warn
