@@ -956,6 +956,43 @@ jobs:
             } else {
               foreach ($row in $reports) { [void]$sb.AppendLine([string]$row) }
             }
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("----- logs (linhas com report) -----")
+            $reportLineFiles = @(Get-P3LogFiles)
+            $anyReportLine = $false
+            foreach ($file in $reportLineFiles) {
+              $raw = Read-TextFile $file.FullName
+              $hits = New-Object System.Collections.Generic.List[string]
+              foreach ($line in ($raw -split '\r?\n')) {
+                if ($line -match '(?i)report') { [void]$hits.Add([string]$line) }
+              }
+              if ($hits.Count -eq 0) { continue }
+              $anyReportLine = $true
+              $shown = Format-RelativeSize $Install $file.FullName "install" ([int64]$file.Length)
+              $logLabel = "install\log"
+              if (-not [string]::IsNullOrWhiteSpace($shown)) {
+                $splitAt = $shown.IndexOf("  ")
+                if ($splitAt -ge 0 -and ($splitAt + 2) -lt $shown.Length) { $logLabel = $shown.Substring($splitAt + 2) }
+              }
+              [void]$sb.AppendLine(("== {0} ==" -f $logLabel))
+              [void]$sb.AppendLine((Redact-Text ($hits -join "`n")))
+            }
+            if (-not $anyReportLine) { [void]$sb.AppendLine("linhas com report: ausentes") }
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("----- ficheiros htm html xml png posteriores ao arranque (caminho relativo e tamanho) -----")
+            if ($null -eq $script:runStarts -or $script:runStarts.Count -eq 0) {
+              [void]$sb.AppendLine("arranques: nenhum")
+            } else {
+              foreach ($run in $script:runStarts) {
+                [void]$sb.AppendLine(("== {0} ==" -f $run.stem))
+                $changed = @(Get-ChangedReportFiles ([datetime]$run.started))
+                if ($changed.Count -eq 0) {
+                  [void]$sb.AppendLine("ficheiros posteriores: ausentes")
+                } else {
+                  foreach ($row in $changed) { [void]$sb.AppendLine([string]$row) }
+                }
+              }
+            }
             $text = Redact-Text ($sb.ToString())
             if (-not $text.EndsWith("`n")) { $text = $text + "`n" }
             [System.IO.File]::WriteAllText((Join-Path $OutDir "diagnostico.txt"), $text, $utf8)
@@ -965,7 +1002,7 @@ jobs:
 
           function Redact-OutDir {
             if (-not (Test-Path $OutDir)) { return }
-            $allowed = @(".htm", ".html", ".xml", ".log", ".txt", ".json")
+            $allowed = @(".htm", ".html", ".xml", ".log", ".txt", ".json", ".csv")
             foreach ($file in @(Get-ChildItem -Path $OutDir -File)) {
               $ext = $file.Extension.ToLowerInvariant()
               if ($allowed -notcontains $ext) { continue }
@@ -983,19 +1020,113 @@ jobs:
             $names = @("$stem.htm", "$stem.html", "$stem.xml")
             $direct = Join-Path $Install "reports"
             foreach ($name in $names) {
+              if (Test-ForbiddenName $name) { continue }
               $candidate = Join-Path $direct $name
               if (Test-Path -LiteralPath $candidate) { return (Resolve-Path -LiteralPath $candidate).Path }
             }
             $roots = @($Install, (Join-Path $env:APPDATA "MetaQuotes"))
-            foreach ($name in $names) {
-              foreach ($root in $roots) {
-                if (-not (Test-Path $root)) { continue }
+            foreach ($root in $roots) {
+              if (-not (Test-Path $root)) { continue }
+              foreach ($name in $names) {
+                if (Test-ForbiddenName $name) { continue }
                 $hit = Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue |
+                  Sort-Object -Property FullName |
                   Select-Object -First 1
                 if ($hit) { return $hit.FullName }
               }
             }
             return $null
+          }
+
+          function Format-RelativeSize([string]$root, [string]$fullName, [string]$prefix, [int64]$length) {
+            if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($fullName)) { return $null }
+            $rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\', '/')
+            $full = [System.IO.Path]::GetFullPath($fullName)
+            $sep = [System.IO.Path]::DirectorySeparatorChar
+            $rootWithSep = $rootFull + $sep
+            if (-not $full.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+            $rel = $full.Substring($rootWithSep.Length) -replace '[\\/]', '\'
+            if ([string]::IsNullOrWhiteSpace($rel)) { return $null }
+            if ($rel -match '^[A-Za-z]:') { return $null }
+            return ("{0}  {1}\{2}" -f $length, $prefix, $rel)
+          }
+
+          function Get-ChangedReportFiles([datetime]$since) {
+            $rows = New-Object System.Collections.Generic.List[string]
+            $roots = @(
+              [pscustomobject]@{ Root = $Install; Prefix = "install" },
+              [pscustomobject]@{ Root = (Join-Path $env:APPDATA "MetaQuotes"); Prefix = "appdata" }
+            )
+            foreach ($entry in $roots) {
+              if (-not (Test-Path $entry.Root)) { continue }
+              $files = @(Get-ChildItem -Path $entry.Root -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                  $_.Extension -match '(?i)^\.(htm|html|xml|png)$' -and
+                  $_.LastWriteTime -gt $since -and
+                  -not (Test-ForbiddenName $_.Name)
+                } |
+                Sort-Object -Property FullName)
+              foreach ($file in $files) {
+                $shown = Format-RelativeSize $entry.Root $file.FullName $entry.Prefix ([int64]$file.Length)
+                if ([string]::IsNullOrWhiteSpace($shown)) { continue }
+                $clean = (Redact-Text $shown).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($clean)) { [void]$rows.Add($clean) }
+              }
+            }
+            return $rows
+          }
+
+          function Find-Stats([datetime]$since) {
+            $testerRoot = Join-Path $Install "Tester"
+            if (-not (Test-Path $testerRoot)) { return $null }
+            $hits = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+            foreach ($agent in @(Get-ChildItem -Path $testerRoot -Directory -ErrorAction SilentlyContinue)) {
+              $candidate = Join-Path (Join-Path (Join-Path $agent.FullName "MQL5") "Files") "forge_p3_stats.csv"
+              if (-not (Test-Path -LiteralPath $candidate)) { continue }
+              $item = Get-Item -LiteralPath $candidate
+              if ($item.LastWriteTime -gt $since) { [void]$hits.Add($item) }
+            }
+            $ordered = @($hits | Sort-Object -Property LastWriteTime -Descending)
+            if ($ordered.Count -eq 0) { return $null }
+            return [string]$ordered[0].FullName
+          }
+
+          function Copy-Stats([string]$source, [string]$stem) {
+            $dest = Join-Path $OutDir ($stem + "-stats.csv")
+            Copy-Item -LiteralPath $source -Destination $dest -Force
+            $clean = Redact-Text (Read-TextFile $dest)
+            if (-not $clean.EndsWith("`n")) { $clean = $clean + "`n" }
+            [System.IO.File]::WriteAllText($dest, $clean, $utf8)
+            return $dest
+          }
+
+          function Test-StatsShape([string]$text) {
+            if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+            return ($text -match '(?m)^profit,.+$') -and ($text -match '(?m)^trades,.+$') -and ($text -match '(?m)^equity_dd,.+$') -and ($text -match '(?m)^balance_dd,.+$')
+          }
+
+          function Test-SameStats([string]$left, [string]$right) {
+            if ($null -eq $left -or $null -eq $right) { return $false }
+            $a = $left.Trim()
+            $b = $right.Trim()
+            if (-not (Test-StatsShape $a) -or -not (Test-StatsShape $b)) { return $false }
+            return ($a -eq $b)
+          }
+
+          function Resolve-RunOutcome([string]$stem, [string]$found, [string]$stats, [bool]$loginRefused) {
+            if ((-not $found) -and $loginRefused) {
+              return [pscustomobject]@{ stop = $true; reason = "login demo recusado"; copyStats = -not [string]::IsNullOrWhiteSpace($stats) }
+            }
+            if ((-not $found) -and -not [string]::IsNullOrWhiteSpace($stats)) {
+              return [pscustomobject]@{ stop = $true; reason = "relatorio ausente; stats presentes"; copyStats = $true }
+            }
+            if (-not $found) {
+              return [pscustomobject]@{ stop = $true; reason = ("P3: relatorio {0}.htm, {0}.html ou {0}.xml ausente" -f $stem); copyStats = $false }
+            }
+            if ([string]::IsNullOrWhiteSpace($stats)) {
+              return [pscustomobject]@{ stop = $true; reason = ("P3: stats {0} ausentes" -f $stem); copyStats = $false }
+            }
+            return [pscustomobject]@{ stop = $false; reason = ""; copyStats = $true }
           }
 
           function Write-TesterIni([string]$path, [string]$stem) {
@@ -1032,7 +1163,7 @@ jobs:
               "UseRemote=0",
               "UseCloud=0",
               "Visual=0",
-              ("Report={0}" -f (Join-Path (Join-Path $Install "reports") $stem)),
+              ("Report=reports\{0}" -f $stem),
               "ReplaceReport=1",
               "ShutdownTerminal=1"
             )
@@ -1061,8 +1192,10 @@ jobs:
             $psi.CreateNoWindow = $true
             $proc = New-Object System.Diagnostics.Process
             $proc.StartInfo = $psi
+            $started = Get-Date
+            [void]$script:runStarts.Add([pscustomobject]@{ stem = $stem; started = $started })
             [void]$proc.Start()
-            $deadline = (Get-Date).AddMinutes(45)
+            $deadline = $started.AddMinutes(45)
             $found = $null
             $disposition = "desconhecido"
             while ((Get-Date) -lt $deadline) {
@@ -1081,14 +1214,21 @@ jobs:
             }
             Start-Sleep -Seconds 3
             if (-not $found) { $found = Find-Report $stem }
-            $authStop = (-not $found) -and (Test-LoginRefused)
-            if ($authStop) {
+            $stats = Find-Stats $started
+            $loginRefused = (-not $found) -and (Test-LoginRefused)
+            $outcome = Resolve-RunOutcome $stem $found $stats $loginRefused
+            if ($loginRefused) {
               $script:loginRecusado = $true
               $disposition = "{0}; login demo recusado" -f $disposition
             }
             [void]$script:runNotes.Add(("terminal64 {0}: {1}" -f $stem, $disposition))
-            if ($authStop) { throw "login demo recusado" }
-            if (-not $found) { throw ("P3: relatorio {0}.htm, {0}.html ou {0}.xml ausente" -f $stem) }
+            if ($stats) {
+              [void]$script:runNotes.Add(("stats {0}: presente" -f $stem))
+            } else {
+              [void]$script:runNotes.Add(("stats {0}: ausente" -f $stem))
+            }
+            if ($outcome.copyStats -and $stats) { Copy-Stats $stats $stem | Out-Null }
+            if ($outcome.stop) { throw $outcome.reason }
             return $found
           }
 
@@ -1114,6 +1254,7 @@ jobs:
           }
 
           $script:runNotes = New-Object System.Collections.Generic.List[string]
+          $script:runStarts = New-Object System.Collections.Generic.List[object]
           $script:loginRecusado = $false
           try {
             Install-OfficialMt5
@@ -1132,10 +1273,18 @@ jobs:
               throw "P3: compilacao nao aceite (exit=$code)"
             }
             Copy-Item $ex5 (Join-Path $OutDir "ForgeSynthMA.ex5") -Force
+            # run2 reutiliza o historico ja descarregado; a pasta de instalacao nao e limpa entre runs.
             $report1 = Copy-Report (Invoke-Tester "run1") "run1"
             $report2 = Copy-Report (Invoke-Tester "run2") "run2"
             $m1 = Read-Metrics $report1
             $m2 = Read-Metrics $report2
+            $stats1Path = Join-Path $OutDir "run1-stats.csv"
+            $stats2Path = Join-Path $OutDir "run2-stats.csv"
+            if (-not (Test-Path -LiteralPath $stats1Path) -or -not (Test-Path -LiteralPath $stats2Path)) {
+              throw "P3: stats ausentes"
+            }
+            $s1 = Read-TextFile $stats1Path
+            $s2 = Read-TextFile $stats2Path
             [System.IO.File]::WriteAllText($log, (Redact-Text (Read-TextFile $log)), $utf8)
             $payload1 = [ordered]@{
               run = "1"
@@ -1164,9 +1313,17 @@ jobs:
             [System.IO.File]::WriteAllText((Join-Path $OutDir "run1.json"), (($payload1 | ConvertTo-Json) + "`n"), $utf8)
             [System.IO.File]::WriteAllText((Join-Path $OutDir "run2.json"), (($payload2 | ConvertTo-Json) + "`n"), $utf8)
             $same = ($m1.trades -eq $m2.trades) -and ($m1.profit -eq $m2.profit) -and ($m1.drawdown -eq $m2.drawdown) -and ($m1.drawdown_label -eq $m2.drawdown_label)
-            $cmp = [ordered]@{ equal = [bool]$same; trades = $m1.trades; profit = $m1.profit; drawdown = $m1.drawdown }
+            $statsSame = Test-SameStats $s1 $s2
+            $cmp = [ordered]@{
+              equal = [bool]($same -and $statsSame)
+              trades = $m1.trades
+              profit = $m1.profit
+              drawdown = $m1.drawdown
+              stats_equal = [bool]$statsSame
+            }
             [System.IO.File]::WriteAllText((Join-Path $OutDir "comparacao.json"), (($cmp | ConvertTo-Json) + "`n"), $utf8)
             if (-not $same) { throw "P3: os dois runs nao reproduziram profit, trades e drawdown" }
+            if (-not $statsSame) { throw "P3: os stats dos dois runs nao sao iguais" }
             [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), "p3: relatorios reproduzidos`n", $utf8)
           } catch {
             $failed = $true
@@ -1246,4 +1403,6 @@ jobs:
           Show-Artifact "installer-signature.txt"
           Show-Artifact "resultado.txt"
           Show-Artifact "diagnostico.txt"
+          Show-Artifact "run1-stats.csv"
+          Show-Artifact "run2-stats.csv"
           Show-Artifact "MANIFEST.sha256"

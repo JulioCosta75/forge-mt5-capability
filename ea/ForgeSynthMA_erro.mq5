@@ -141,6 +141,23 @@ void OnTick()
       return;
    OpenDirection(cross_up);
   }
+
+// Agent sandbox file (not FILE_COMMON): <data>\Tester\<agent>\MQL5\Files.
+double OnTester()
+  {
+   FileDelete("forge_p3_stats.csv");
+   int handle = FileOpen("forge_p3_stats.csv", FILE_WRITE|FILE_TXT|FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+      return(0.0);
+   string body = StringFormat("profit,%s\r\ntrades,%s\r\nequity_dd,%s\r\nbalance_dd,%s\r\n",
+                               DoubleToString(TesterStatistics(STAT_PROFIT), 2),
+                               DoubleToString(TesterStatistics(STAT_TRADES), 0),
+                               DoubleToString(TesterStatistics(STAT_EQUITY_DD), 2),
+                               DoubleToString(TesterStatistics(STAT_BALANCE_DD), 2));
+   FileWriteString(handle, body);
+   FileClose(handle);
+   return(0.0);
+  }
 //+------------------------------------------------------------------+
 
 // P2: deliberate syntax error. This file must fail compilation.
