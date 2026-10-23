@@ -1392,9 +1392,6 @@ jobs:
                 Write-Output "p3: falhou"
                 Write-Output "redacao do artefacto falhou"
               } else {
-                if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) {
-                  "redaction_unsafe=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
-                }
                 Write-Output "P3: upload do artefacto bloqueado"
               }
             } else {
@@ -1410,10 +1407,16 @@ jobs:
               Remove-Item $PrivateDir -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
+          if (-not $script:redactionUnsafe) {
+            if ([string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) {
+              throw "P3: GITHUB_OUTPUT ausente; artefacto nao confirmado"
+            }
+            "artifact_safe=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+          }
           if ($failed) { exit 1 }
 
       - name: Artefactos P3
-        if: always() && steps.tester.outputs.redaction_unsafe != 'true'
+        if: always() && (steps.tester.outputs.artifact_safe == 'true' || steps.demo.outputs.skipped == 'true')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p3-strategy-tester
@@ -1426,9 +1429,16 @@ jobs:
           MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
           MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
           MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+          ARTIFACT_SAFE: ${{ steps.tester.outputs.artifact_safe }}
+          DEMO_SKIPPED: ${{ steps.demo.outputs.skipped }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          $showArtifact = ($env:ARTIFACT_SAFE -eq "true") -or ($env:DEMO_SKIPPED -eq "true")
+          if (-not $showArtifact) {
+            Write-Output "p3: artefacto retido (redacao nao confirmada)"
+            exit 0
+          }
           foreach ($name in @("MT5_DEMO_LOGIN", "MT5_DEMO_PASSWORD", "MT5_DEMO_SERVER")) {
             $value = [Environment]::GetEnvironmentVariable($name)
             if (-not [string]::IsNullOrEmpty($value)) {
