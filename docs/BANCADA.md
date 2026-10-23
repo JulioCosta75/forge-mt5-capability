@@ -102,7 +102,7 @@ Cada job tem um passo final `Evidencia no log` com `if: always()`, portanto tamb
 
 Em P1 e P2 imprime ainda as linhas do log de compilação que contenham `error`, `warning` ou `result`, sem distinção de maiúsculas, no máximo 50. Se houver mais, o log indica o corte. Não imprime o resto do log.
 
-Em P3 esse passo não imprime o log de compilação nem o corpo dos relatórios. Imprime `diagnostico.txt` (ou `ausente`), `run1-stats.csv` e `run2-stats.csv` (ou `ausente` em cada um). Volta a aplicar `::add-mask::` e `Hide`, e omite linhas que ainda contenham o login, a password ou o servidor. Sem segredos, `resultado.txt` contém `skipped: demo secrets ausentes`, `diagnostico.txt` diz que o terminal não foi instalado, os csv de stats ficam ausentes, e `installer-signature.txt` está ausente.
+Em P3, esse passo imprime os ficheiros do artefacto só quando `steps.tester.outputs.artifact_safe` é `true` ou `steps.demo.outputs.skipped` é `true`. Nesse caso não imprime o log de compilação nem o corpo dos relatórios. Imprime `diagnostico.txt` (ou `ausente`), `run1-stats.csv` e `run2-stats.csv` (ou `ausente` em cada um). Volta a aplicar `::add-mask::` e `Hide`, e omite linhas que ainda contenham o login, a password ou o servidor. Sem segredos, `resultado.txt` contém `skipped: demo secrets ausentes`, `diagnostico.txt` diz que o terminal não foi instalado, os csv de stats ficam ausentes, e `installer-signature.txt` está ausente. Sem essa confirmação, o passo imprime apenas `p3: artefacto retido (redacao nao confirmada)`.
 
 Isto mostra o desfecho a quem lê o log do Actions. Não torna descarregável um artefacto que o verificador não consiga abrir. Se o job for cancelado por tempo limite antes deste passo, o log pode ficar sem este bloco.
 
