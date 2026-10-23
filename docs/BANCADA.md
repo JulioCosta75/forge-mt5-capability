@@ -112,7 +112,7 @@ O workflow pede apenas `permissions: contents: read` para P1, P2 e P3. Não pede
 
 ## Segredos
 
-Os três valores existem só como GitHub Secrets, criados pelo Fundador. Não há credenciais nestes ficheiros. O workflow não escreve os valores em claro. Em P3, cada passo que os recebe regista `::add-mask::` e passa o texto impresso ou gravado por `Hide`, que substitui cada valor de pelo menos 3 caracteres por `[redacted]`. Linhas que ainda contenham o login, a password ou o servidor não são gravadas. Antes do upload, os ficheiros de texto do artefacto passam outra vez por essa redacção. O passo de evidência de P3 não imprime o log de compilação nem o corpo dos relatórios; imprime o diagnóstico já redatado e os csv de stats, também passados por `Hide`.
+Os três valores existem só como GitHub Secrets, criados pelo Fundador. Não há credenciais nestes ficheiros. O workflow não escreve os valores em claro. Em P3, cada passo que os recebe regista `::add-mask::` e passa o texto impresso ou gravado por `Hide`, que substitui cada valor de pelo menos 3 caracteres por `[redacted]`. Linhas que ainda contenham o login, a password ou o servidor não são gravadas. Antes do upload, os ficheiros de texto do artefacto passam outra vez por essa redacção. Se a reescrita de um desses ficheiros falhar, o ficheiro é apagado. Se mesmo assim permanecer, a pasta de artefactos é apagada e, se a pasta não sair, o upload não corre. O job termina com `p3: falhou` e `redacao do artefacto falhou`. O passo de evidência de P3 não imprime o log de compilação nem o corpo dos relatórios; imprime o diagnóstico já redatado e os csv de stats, também passados por `Hide`.
 
 ## Fora desta bancada
 

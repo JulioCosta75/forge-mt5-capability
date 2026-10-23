@@ -615,6 +615,7 @@ jobs:
           }
 
       - name: Strategy Tester
+        id: tester
         if: steps.demo.outputs.skipped == 'false'
         env:
           MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
@@ -1000,19 +1001,47 @@ jobs:
             Write-Output $text
           }
 
+          function Remove-ArtifactFile([string]$path) {
+            if (-not (Test-Path -LiteralPath $path)) { return }
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.IsReadOnly) { $item.IsReadOnly = $false }
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $path) { throw "P3: ficheiro por redigir permanece" }
+          }
+
+          function Try-SanitizeFile([string]$path) {
+            try {
+              $item = Get-Item -LiteralPath $path -Force
+              if ($item.IsReadOnly) { $item.IsReadOnly = $false }
+              $clean = Redact-Text (Read-TextFile $path)
+              if (-not $clean.EndsWith("`n")) { $clean = $clean + "`n" }
+              [System.IO.File]::WriteAllText($path, $clean, $utf8)
+              return "redacted"
+            } catch {
+              Write-Host (Redact-Text ([string]$_.Exception.Message))
+              try {
+                Remove-ArtifactFile $path
+                Write-Host ("removido apos falha de redacao: {0}" -f (Split-Path -Leaf $path))
+                return "removed"
+              } catch {
+                $script:redactionUnsafe = $true
+                Write-Host ("P3: redacao falhou e o ficheiro permanece: {0}" -f (Split-Path -Leaf $path))
+                return "unsafe"
+              }
+            }
+          }
+
           function Redact-OutDir {
             if (-not (Test-Path $OutDir)) { return }
             $allowed = @(".htm", ".html", ".xml", ".log", ".txt", ".json", ".csv")
-            foreach ($file in @(Get-ChildItem -Path $OutDir -File)) {
+            foreach ($file in @(Get-ChildItem -Path $OutDir -File -Force)) {
+              if (Test-ForbiddenName $file.Name) {
+                try { Remove-ArtifactFile $file.FullName } catch { $script:redactionUnsafe = $true }
+                continue
+              }
               $ext = $file.Extension.ToLowerInvariant()
               if ($allowed -notcontains $ext) { continue }
-              if (Test-ForbiddenName $file.Name) { continue }
-              try {
-                $clean = Redact-Text (Read-TextFile $file.FullName)
-                [System.IO.File]::WriteAllText($file.FullName, $clean, $utf8)
-              } catch {
-                Write-Output (Redact-Text ([string]$_.Exception.Message))
-              }
+              $null = Try-SanitizeFile $file.FullName
             }
           }
 
@@ -1094,9 +1123,8 @@ jobs:
           function Copy-Stats([string]$source, [string]$stem) {
             $dest = Join-Path $OutDir ($stem + "-stats.csv")
             Copy-Item -LiteralPath $source -Destination $dest -Force
-            $clean = Redact-Text (Read-TextFile $dest)
-            if (-not $clean.EndsWith("`n")) { $clean = $clean + "`n" }
-            [System.IO.File]::WriteAllText($dest, $clean, $utf8)
+            $state = Try-SanitizeFile $dest
+            if ($state -ne "redacted") { throw "P3: redacao do artefacto falhou" }
             return $dest
           }
 
@@ -1175,8 +1203,8 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($ext)) { $ext = ".htm" }
             $dest = Join-Path $OutDir ($stem + $ext.ToLowerInvariant())
             Copy-Item -LiteralPath $source -Destination $dest -Force
-            $clean = Redact-Text (Read-TextFile $dest)
-            [System.IO.File]::WriteAllText($dest, $clean, $utf8)
+            $state = Try-SanitizeFile $dest
+            if ($state -ne "redacted") { throw "P3: redacao do artefacto falhou" }
             return $dest
           }
 
@@ -1256,6 +1284,7 @@ jobs:
           $script:runNotes = New-Object System.Collections.Generic.List[string]
           $script:runStarts = New-Object System.Collections.Generic.List[object]
           $script:loginRecusado = $false
+          $script:redactionUnsafe = $false
           try {
             Install-OfficialMt5
             $experts = Join-Path $Install "MQL5\Experts"
@@ -1337,8 +1366,38 @@ jobs:
               Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 2
             try { Write-P3Diagnostic } catch { Write-Output (Redact-Text ([string]$_.Exception.Message)) }
-            try { Redact-OutDir } catch { Write-Output (Redact-Text ([string]$_.Exception.Message)) }
-            Write-Manifest $OutDir
+            try { Redact-OutDir } catch {
+              $script:redactionUnsafe = $true
+              Write-Output (Redact-Text ([string]$_.Exception.Message))
+            }
+            if ($script:redactionUnsafe) {
+              $failed = $true
+              $removed = $false
+              try {
+                if (Test-Path -LiteralPath $OutDir) {
+                  Get-ChildItem -LiteralPath $OutDir -Force -Recurse -ErrorAction SilentlyContinue |
+                    ForEach-Object { if (-not $_.PSIsContainer -and $_.IsReadOnly) { $_.IsReadOnly = $false } }
+                  Remove-Item -LiteralPath $OutDir -Recurse -Force -ErrorAction Stop
+                }
+                $removed = -not (Test-Path -LiteralPath $OutDir)
+              } catch {
+                $removed = $false
+              }
+              if ($removed) {
+                New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+                [System.IO.File]::WriteAllText((Join-Path $OutDir "resultado.txt"), "p3: falhou`nredacao do artefacto falhou`n", $utf8)
+                Write-Manifest $OutDir
+                Write-Output "p3: falhou"
+                Write-Output "redacao do artefacto falhou"
+              } else {
+                if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) {
+                  "redaction_unsafe=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+                }
+                Write-Output "P3: upload do artefacto bloqueado"
+              }
+            } else {
+              Write-Manifest $OutDir
+            }
             if (Test-Path $PrivateDir) {
               Remove-Item $PrivateDir -Recurse -Force -ErrorAction SilentlyContinue
             }
@@ -1346,7 +1405,7 @@ jobs:
           if ($failed) { exit 1 }
 
       - name: Artefactos P3
-        if: always()
+        if: always() && steps.tester.outputs.redaction_unsafe != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p3-strategy-tester
