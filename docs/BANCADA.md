@@ -65,6 +65,19 @@ Não prova: conta real, ordens fora do tester, o mesmo resultado noutro corretor
 
 Cada job instala o terminal à parte. A instalação espera no máximo 15 minutos pelos executáveis. Se o histórico demo não chegar nos 45 minutos daquele run, P3 falha; P1 e P2 não dependem desse prazo.
 
+## P5 — indicador lido por `iCustom`
+
+O P3 provou o Strategy Tester com um EA. O P5 prova a mesma via para um **indicador**. P5 é um job separado, com os mesmos segredos, o mesmo instalador, o mesmo `[Tester]` (EURUSD, H1, modelo 1, de 2024.01.02 a 2024.02.02, local, sem rede nem cloud), os mesmos prazos e a mesma redação. Sem os três segredos, escreve `skipped: demo secrets ausentes` e termina com 0.
+
+- `ea/ForgeSynthInd.mq5` é um indicador com um buffer: a média móvel simples de 12 períodos sobre o fecho, calculada em ciclo explícito, sem `iMA`. Compila para `MQL5\Indicators`.
+- `ea/ForgeP5Check.mq5` é um EA de teste que não abre ordens. Em cada barra nova, lê o valor da barra fechada anterior com `iCustom(..., "ForgeSynthInd")` e `CopyBuffer`, e regista a hora, o fecho (`iClose`) e o buffer com 10 casas. `#property tester_indicator` leva o `.ex5` do indicador ao agente. `OnTester()` apaga e volta a gravar `forge_p5_buffers.csv`, com o cabeçalho `time,close,sma`.
+- O job compila os dois, com a mesma regra do P1 (`0 errors`, sem contagem positiva, `.ex5` maior do que zero), e corre dois arranques. Cada arranque tem de produzir o relatório e o csv, que é copiado como `run1-stats.csv` ou `run2-stats.csv`.
+- Para passar, os dois csv têm de ter a forma esperada e o mesmo texto. Depois, `tools/p5_referencia.py` recalcula a SMA(12) **a partir dos fechos do próprio csv**, em `Decimal` e sem o código MQL5, e compara-a com o buffer de cada linha a partir da 12.ª. Exige pelo menos 100 linhas comparadas e uma diferença máxima de `0.00000001`. O resultado fica em `referencia.json` e `comparacao.json`, e `resultado.txt` diz `p5: buffers conferidos`.
+
+Prova, quando o job fica verde com segredos: neste terminal e com este histórico, o indicador compilou, foi carregado por `iCustom` no tester, e o buffer coincidiu com uma referência calculada fora do MQL5, igual em dois runs.
+
+Não prova: indicadores com vários buffers, desenho no gráfico, recálculo em tempo real fora do tester, outro símbolo, período ou corretor, nem qualquer mérito de trading. As primeiras 11 linhas do csv não são comparadas, porque a média precisa de fechos anteriores ao início do csv.
+
 ## Instalador
 
 A página oficial `https://www.metatrader5.com/en/download`, consultada em 2026-10-23, aponta para `https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/mt5setup.exe`. O workflow descarrega esse URL. Antes de executar `mt5setup.exe`, grava `installer-signature.txt` e imprime no log estas linhas:
